@@ -117,7 +117,7 @@ fn parse_verses(source: impl BufRead, book_code: &str) -> Result<Vec<Verse>, Err
             },
             Event::Text(text) if excluded_depth == 0 => {
                 if let Some(verse) = &mut current {
-                    verse.text.push_str(&text.xml_content()?);
+                    verse.text.push_str(&text.xml10_content()?);
                 }
             }
             Event::CData(text) if excluded_depth == 0 => {

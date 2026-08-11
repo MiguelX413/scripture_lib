@@ -51,7 +51,7 @@ pub(crate) fn parse_metadata(source: impl BufRead) -> Result<Metadata, Error> {
                 record_empty_element(&reader, &event, &stack, &mut metadata)?;
             }
             Event::Text(text) => {
-                let decoded = text.xml_content()?;
+                let decoded = text.xml10_content()?;
                 record_text(&stack, &decoded, current_book.as_deref(), &mut metadata);
             }
             Event::GeneralRef(reference) => {

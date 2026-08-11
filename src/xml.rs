@@ -1,7 +1,7 @@
 use std::io::BufRead;
 
-use quick_xml::Reader;
 use quick_xml::events::BytesStart;
+use quick_xml::{Reader, XmlVersion};
 
 pub(crate) fn attribute<R: BufRead>(
     reader: &Reader<R>,
@@ -13,7 +13,7 @@ pub(crate) fn attribute<R: BufRead>(
         if attribute.key.local_name().as_ref() == name {
             return Ok(Some(
                 attribute
-                    .decode_and_unescape_value(reader.decoder())?
+                    .decoded_and_normalized_value(XmlVersion::default(), reader.decoder())?
                     .into_owned(),
             ));
         }
