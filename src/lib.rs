@@ -1,4 +1,33 @@
-//! Reader for unpacked Digital Bible Library (DBL) bundles.
+#![warn(missing_docs)]
+
+//! Read unpacked Digital Bible Library (DBL) bundles and select passages from
+//! their USX scripture files.
+//!
+//! Start with [`ScriptureLibrary::discover`] to load a bundle or a directory of
+//! bundles. Bundle metadata includes its localized display name, preferred
+//! abbreviation, canonicalized [`icu_locale::Locale`], writing direction, and
+//! available books. USX files are parsed on demand when [`Book::verses`] or
+//! [`DblBundle::passage`] is called.
+//!
+//! Passage requests are structured values rather than strings. Constructors on
+//! [`PassageRequest`] support one chapter, a chapter range, one verse, a verse
+//! range within a chapter, or a range spanning chapters.
+//!
+//! # Example
+//!
+//! ```no_run
+//! use scripture_lib::{PassageRequest, ScriptureLibrary};
+//!
+//! # fn main() -> Result<(), scripture_lib::Error> {
+//! let library = ScriptureLibrary::discover("offline")?;
+//! let bundle = library.get("LXXUP").expect("LXXUP bundle is installed");
+//! let request = PassageRequest::verse_range("Genesis", 1, 2, 3, 4);
+//! let passage = bundle.passage(&request)?;
+//!
+//! println!("{}", passage.text());
+//! # Ok(())
+//! # }
+//! ```
 
 use std::collections::BTreeMap;
 use std::fs::{self, File};
@@ -46,10 +75,15 @@ impl ScriptureLibrary {
         Ok(Self { bundles })
     }
 
+    /// Returns the discovered bundles in path order.
     pub fn bundles(&self) -> &[DblBundle] {
         &self.bundles
     }
 
+    /// Finds a bundle by its preferred or non-localized abbreviation.
+    ///
+    /// Matching is ASCII case-insensitive. If multiple bundles use the same
+    /// abbreviation, the first bundle in [`Self::bundles`] is returned.
     pub fn get(&self, abbreviation: &str) -> Option<&DblBundle> {
         self.bundles.iter().find(|bundle| {
             bundle.abbreviation.eq_ignore_ascii_case(abbreviation)
@@ -64,22 +98,34 @@ impl ScriptureLibrary {
 #[derive(Debug)]
 pub struct DblBundle {
     root: PathBuf,
+    /// Unique DBL bundle identifier from `DBLMetadata/@id`.
     pub id: String,
+    /// Optional DBL metadata revision number.
     pub revision: Option<u32>,
+    /// Non-localized bundle name.
     pub name: String,
+    /// Localized bundle name, when supplied by the metadata.
     pub local_name: Option<String>,
     /// Preferred display abbreviation (`abbreviationLocal` when available).
     pub abbreviation: String,
     /// The non-localized `abbreviation` value from DBL metadata.
     pub metadata_abbreviation: String,
+    /// Localized `abbreviationLocal` value from DBL metadata, when present.
     pub local_abbreviation: Option<String>,
+    /// Canonical scope declaration from DBL metadata, when present.
     pub scope: Option<String>,
+    /// Canonicalized locale parsed from the metadata's LDML or ISO identifier.
     pub locale: Locale,
+    /// Writing direction declared for the bundle's language.
     pub script_direction: ScriptDirection,
     books: Vec<Book>,
 }
 
 impl DblBundle {
+    /// Opens an unpacked DBL bundle rooted at `root`.
+    ///
+    /// Metadata is read immediately, but book USX files are parsed only when
+    /// their contents are requested.
     pub fn open(root: impl AsRef<Path>) -> Result<Self, Error> {
         let root = root.as_ref();
         let metadata_path = root.join(METADATA_FILE);
@@ -135,14 +181,19 @@ impl DblBundle {
         })
     }
 
+    /// Returns the bundle's root directory.
     pub fn root(&self) -> &Path {
         &self.root
     }
 
+    /// Returns the books declared by the bundle's USX publication resources.
     pub fn books(&self) -> &[Book] {
         &self.books
     }
 
+    /// Finds a book by its three-character USX code.
+    ///
+    /// Matching is ASCII case-insensitive.
     pub fn book(&self, code: &str) -> Option<&Book> {
         self.books
             .iter()
@@ -163,21 +214,29 @@ impl DblBundle {
     }
 }
 
+/// Display names declared for a book in DBL metadata.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct BookNames {
+    /// Short abbreviation, such as `Gen`.
     pub abbreviation: Option<String>,
+    /// Short display name, such as `Genesis`.
     pub short: Option<String>,
+    /// Long display name, when the bundle supplies one.
     pub long: Option<String>,
 }
 
+/// One USX book declared by a DBL bundle.
 #[derive(Debug)]
 pub struct Book {
+    /// Three-character USX book code, such as `GEN`.
     pub code: String,
+    /// Names and abbreviation declared for the book.
     pub names: BookNames,
     path: PathBuf,
 }
 
 impl Book {
+    /// Returns the path to the book's USX file.
     pub fn path(&self) -> &Path {
         &self.path
     }
@@ -237,6 +296,7 @@ impl Book {
 pub struct Verse {
     /// USX scripture reference, such as `GEN 1:1`.
     pub sid: String,
+    /// Chapter number containing this verse.
     pub chapter: u32,
     /// Sequential verse number from USX `number`, including bridges such as `1-2`.
     pub number: String,
@@ -244,29 +304,37 @@ pub struct Verse {
     pub alternate_number: Option<String>,
     /// Publication-facing number from USX `pubnumber`.
     pub published_number: Option<String>,
+    /// Plain scripture text collected for the verse.
     pub text: String,
 }
 
 /// One endpoint in a passage request. `verse: None` means the whole chapter.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct PassagePoint {
+    /// One-based chapter number.
     pub chapter: u32,
+    /// One-based verse number, or `None` when the endpoint is a whole chapter.
     pub verse: Option<u32>,
 }
 
 /// A parsed passage request, including its book name or USX code.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PassageRequest {
+    /// USX book code or a book name or abbreviation declared by the bundle.
     pub book: String,
+    /// Inclusive start of the requested passage.
     pub start: PassagePoint,
+    /// Inclusive end of the requested passage.
     pub end: PassagePoint,
 }
 
 impl PassageRequest {
+    /// Requests one whole chapter, such as `Genesis 1`.
     pub fn chapter(book: impl Into<String>, chapter: u32) -> Self {
         Self::chapters(book, chapter, chapter)
     }
 
+    /// Requests an inclusive range of whole chapters, such as `Genesis 1-2`.
     pub fn chapters(book: impl Into<String>, start_chapter: u32, end_chapter: u32) -> Self {
         Self {
             book: book.into(),
@@ -281,14 +349,20 @@ impl PassageRequest {
         }
     }
 
+    /// Requests one verse, such as `Genesis 1:4`.
     pub fn verse(book: impl Into<String>, chapter: u32, verse: u32) -> Self {
         Self::verse_range(book, chapter, verse, chapter, verse)
     }
 
+    /// Requests an inclusive verse range in one chapter, such as `Genesis 1:4-5`.
     pub fn verses(book: impl Into<String>, chapter: u32, start_verse: u32, end_verse: u32) -> Self {
         Self::verse_range(book, chapter, start_verse, chapter, end_verse)
     }
 
+    /// Requests an inclusive verse range that may span chapters.
+    ///
+    /// For example, `verse_range("Genesis", 1, 4, 2, 3)` represents
+    /// `Genesis 1:4-2:3`.
     pub fn verse_range(
         book: impl Into<String>,
         start_chapter: u32,
@@ -348,7 +422,9 @@ impl PassageRequest {
 /// Verses selected by a passage request.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Passage {
+    /// The request that selected these verses.
     pub request: PassageRequest,
+    /// Selected verses in USX document order.
     pub verses: Vec<Verse>,
 }
 
@@ -363,58 +439,106 @@ impl Passage {
     }
 }
 
+/// Writing direction for scripture text.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum ScriptDirection {
+    /// Text runs from left to right.
     #[default]
     LeftToRight,
+    /// Text runs from right to left.
     RightToLeft,
 }
 
+/// An error encountered while loading DBL metadata, parsing USX, or selecting a passage.
 #[derive(Debug, Error)]
 pub enum Error {
+    /// A filesystem operation failed.
     #[error("I/O error: {0}")]
     Io(#[from] io::Error),
+    /// An XML document was malformed.
     #[error("could not parse XML: {0}")]
     Xml(#[from] quick_xml::Error),
+    /// XML text could not be decoded with the document's encoding.
     #[error("could not decode XML text: {0}")]
     XmlEncoding(#[from] quick_xml::encoding::EncodingError),
+    /// An XML character or entity reference was invalid.
     #[error("could not unescape XML text: {0}")]
     XmlEscape(#[from] quick_xml::escape::EscapeError),
+    /// The requested directory does not contain `metadata.xml`.
     #[error("DBL bundle at {0} has no metadata.xml")]
     MissingMetadata(PathBuf),
+    /// A required DBL metadata field is absent.
     #[error("DBL metadata is missing {0}")]
     MissingField(&'static str),
+    /// A DBL language identifier is not a valid locale.
     #[error("invalid locale {value:?}: {reason}")]
-    InvalidLocale { value: String, reason: String },
+    InvalidLocale {
+        /// Locale identifier read from DBL metadata.
+        value: String,
+        /// Diagnostic reported by the locale parser.
+        reason: String,
+    },
+    /// A required USX element or attribute is absent.
     #[error("USX document is missing required {0}")]
     MissingUsxField(&'static str),
+    /// The document declares a USX version unsupported by this crate.
     #[error("unsupported USX version {0:?}")]
     UnsupportedUsxVersion(String),
+    /// The USX book code differs from the code declared by DBL metadata.
     #[error("USX book code {actual:?} does not match expected code {expected:?}")]
-    MismatchedBookCode { expected: String, actual: String },
-    #[error("USX verse end {actual:?} does not match open verse {expected:?}")]
-    MismatchedVerseEnd { expected: String, actual: String },
-    #[error("USX verse end {0:?} has no corresponding open verse")]
-    UnexpectedVerseEnd(String),
-    #[error("USX vid {actual:?} does not match open verse {expected:?}")]
-    MismatchedVerseContinuation { expected: String, actual: String },
-    #[error("USX {0} milestones must be empty elements")]
-    NonEmptyUsxMilestone(&'static str),
-    #[error("invalid style {actual:?} on USX {element}; expected {expected:?}")]
-    InvalidUsxStyle {
-        element: &'static str,
-        expected: &'static str,
+    MismatchedBookCode {
+        /// Book code declared by DBL metadata.
+        expected: String,
+        /// Book code found in the USX document.
         actual: String,
     },
+    /// A verse-ending milestone refers to a different verse than the open verse.
+    #[error("USX verse end {actual:?} does not match open verse {expected:?}")]
+    MismatchedVerseEnd {
+        /// Scripture identifier of the open verse.
+        expected: String,
+        /// Scripture identifier on the verse-ending milestone.
+        actual: String,
+    },
+    /// A verse-ending milestone appears when no verse is open.
+    #[error("USX verse end {0:?} has no corresponding open verse")]
+    UnexpectedVerseEnd(String),
+    /// A verse continuation refers to a different verse than the open verse.
+    #[error("USX vid {actual:?} does not match open verse {expected:?}")]
+    MismatchedVerseContinuation {
+        /// Scripture identifier of the open verse.
+        expected: String,
+        /// Scripture identifier on the continuation element.
+        actual: String,
+    },
+    /// A USX milestone that must be empty contains nested content.
+    #[error("USX {0} milestones must be empty elements")]
+    NonEmptyUsxMilestone(&'static str),
+    /// A USX element uses a style that is invalid for its role.
+    #[error("invalid style {actual:?} on USX {element}; expected {expected:?}")]
+    InvalidUsxStyle {
+        /// USX element containing the invalid style.
+        element: &'static str,
+        /// Style required by the USX specification in this context.
+        expected: &'static str,
+        /// Style read from the document.
+        actual: String,
+    },
+    /// A structured request contains invalid or inconsistent endpoints.
     #[error("invalid passage request {request:?}: {reason}")]
     InvalidPassageRequest {
+        /// Rejected request.
         request: PassageRequest,
+        /// Explanation of the violated request invariant.
         reason: &'static str,
     },
+    /// No book in the bundle matches the requested name or code.
     #[error("book {0:?} was not found in this bundle")]
     BookNotFound(String),
+    /// The requested passage selects no verses in the bundle.
     #[error("passage {0:?} contains no verses in this bundle")]
     PassageNotFound(PassageRequest),
+    /// A USX chapter number is not a positive integer.
     #[error("invalid USX chapter number {0:?}")]
     InvalidChapterNumber(String),
 }
