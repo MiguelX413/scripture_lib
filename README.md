@@ -3,6 +3,8 @@
 A Rust reader for unpacked [Digital Bible Library](https://thedigitalbiblelibrary.org/)
 bundles. It discovers bundle folders from their `metadata.xml`, indexes their USX
 books, and exposes canonicalized locales through ICU4X's `icu_locale::Locale`.
+USX reading follows the official [USFM/USX specification](https://docs.usfm.bible/),
+including pre-3 start milestones and USX 3 `sid`, `eid`, and `vid` semantics.
 
 ```rust
 use scripture_lib::{PassageRequest, ScriptureLibrary};

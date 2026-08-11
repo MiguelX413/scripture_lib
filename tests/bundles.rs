@@ -41,33 +41,58 @@ fn discovers_and_reads_a_dbl_folder() {
   </language>
   <names>
     <name id="book-gen"><abbr>Gen.</abbr><short>Genesis</short><long>Genesis</long></name>
+    <name id="book-exo"><abbr>Ex.</abbr><short>Exodus</short><long>Exodus</long></name>
   </names>
   <manifest>
-    <resource mimeType="application/xml" uri="release/USX_1/GEN.usx" />
+    <resource mimeType="application/xml" uri="scripture.usx" />
     <resource mimeType="application/xml" uri="release/styles.xml" />
   </manifest>
+  <publications>
+    <publication id="p1" default="true">
+      <structure>
+        <content src="release/USX_1/scripture.usx" role="GEN" />
+        <content src="release/USX_1/EXO.usx" role="EXO" />
+      </structure>
+    </publication>
+  </publications>
 </DBLMetadata>"#,
     )
     .unwrap();
     fs::write(
-        directory.0.join("example/release/USX_1/GEN.usx"),
-        r#"<usx version="3.0">
+        directory.0.join("example/release/USX_1/scripture.usx"),
+        r#"<usx version="2.6">
   <book code="GEN" style="id">Genesis</book>
-  <chapter number="1" style="c" sid="GEN 1" />
+  <chapter number="1" style="c" />
   <para style="p">
-    <verse number="1" style="v" sid="GEN 1:1" />First &amp; <char style="add">added</char>.<note style="f">Ignored note</note>
-    <verse number="2" style="v" sid="GEN 1:2" />Second.<verse eid="GEN 1:2" />
-    <verse number="3" style="v" sid="GEN 1:3" />Third, with no end.
+    <verse number="1" style="v" />First &amp; <char style="add">added</char>.<note style="f">Ignored note</note>
+    <verse number="2" style="v" />Second.
+    <verse number="3" style="v" />Third, with no end.
     <verse number="4" style="v" />Fourth, with neither milestone.
     <verse number="5-6" style="v" />Fifth and sixth.
   </para>
-  <chapter eid="GEN 1" />
-  <chapter number="2" style="c" sid="GEN 2" />
+  <chapter number="2" style="c" />
   <para style="p">
-    <verse number="1" style="v" sid="GEN 2:1" />Chapter two, first.
-    <verse number="2" style="v" sid="GEN 2:2" />Chapter two, second.
-    <verse number="3" style="v" sid="GEN 2:3" />Chapter two, third.
+    <verse number="1" style="v" />Chapter two, first.
+    <verse number="2" style="v" />Chapter two, second.
+    <verse number="3" style="v" />Chapter two, third.
   </para>
+</usx>"#,
+    )
+    .unwrap();
+    fs::write(
+        directory.0.join("example/release/USX_1/EXO.usx"),
+        r#"<usx version="3.0">
+  <book code="EXO" style="id" />
+  <chapter number="1" style="c" sid="EXO 1" />
+  <para style="p">
+    <verse number="1" altnumber="1a" pubnumber="I" style="v" sid="EXO 1:1" />Official
+    <char style="add">verse</char> text
+  </para>
+  <para style="q1" vid="EXO 1:1">continues here.<note caller="+" style="f"><char style="ft">Not verse text.</char></note>
+    <verse eid="EXO 1:1" />
+    <verse number="2" style="v" sid="EXO 1:2" />Recovered missing end.
+  </para>
+  <chapter eid="EXO 1" />
 </usx>"#,
     )
     .unwrap();
@@ -83,7 +108,7 @@ fn discovers_and_reads_a_dbl_folder() {
     assert!(library.get("example").is_some());
     assert_eq!(bundle.locale.to_string(), "en-US");
     assert_eq!(bundle.script_direction, ScriptDirection::LeftToRight);
-    assert_eq!(bundle.books().len(), 1);
+    assert_eq!(bundle.books().len(), 2);
 
     let genesis = bundle.book("gen").unwrap();
     assert_eq!(genesis.names.long.as_deref(), Some("Genesis"));
@@ -97,6 +122,13 @@ fn discovers_and_reads_a_dbl_folder() {
     assert_eq!(verses[2].text, "Third, with no end.");
     assert_eq!(verses[3].sid, "GEN 1:4");
     assert_eq!(verses[3].text, "Fourth, with neither milestone.");
+
+    let official = bundle.book("EXO").unwrap().verses().unwrap();
+    assert_eq!(official.len(), 2);
+    assert_eq!(official[0].alternate_number.as_deref(), Some("1a"));
+    assert_eq!(official[0].published_number.as_deref(), Some("I"));
+    assert_eq!(official[0].text, "Official verse text continues here.");
+    assert_eq!(official[1].text, "Recovered missing end.");
 
     assert_eq!(
         bundle

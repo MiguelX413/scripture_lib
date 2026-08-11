@@ -112,14 +112,10 @@ impl DblBundle {
             .usx_resources
             .into_iter()
             .map(|uri| {
-                let code =
-                    book_code_from_uri(&uri).ok_or_else(|| Error::InvalidBookUri(uri.clone()))?;
+                let path = root.join(&uri);
+                let code = parse_usx_book_code(&path)?;
                 let names = metadata.book_names.get(&code).cloned().unwrap_or_default();
-                Ok(Book {
-                    code,
-                    names,
-                    path: root.join(uri),
-                })
+                Ok(Book { code, names, path })
             })
             .collect::<Result<Vec<_>, Error>>()?;
 
@@ -242,8 +238,12 @@ pub struct Verse {
     /// USX scripture reference, such as `GEN 1:1`.
     pub sid: String,
     pub chapter: u32,
-    /// The displayed verse number, which may be a bridge such as `1-2`.
+    /// Sequential verse number from USX `number`, including bridges such as `1-2`.
     pub number: String,
+    /// Alternate-versification number from USX `altnumber`.
+    pub alternate_number: Option<String>,
+    /// Publication-facing number from USX `pubnumber`.
+    pub published_number: Option<String>,
     pub text: String,
 }
 
@@ -386,8 +386,26 @@ pub enum Error {
     MissingField(&'static str),
     #[error("invalid locale {value:?}: {reason}")]
     InvalidLocale { value: String, reason: String },
-    #[error("cannot determine a book code from manifest URI {0:?}")]
-    InvalidBookUri(String),
+    #[error("USX document is missing required {0}")]
+    MissingUsxField(&'static str),
+    #[error("unsupported USX version {0:?}")]
+    UnsupportedUsxVersion(String),
+    #[error("USX book code {actual:?} does not match expected code {expected:?}")]
+    MismatchedBookCode { expected: String, actual: String },
+    #[error("USX verse end {actual:?} does not match open verse {expected:?}")]
+    MismatchedVerseEnd { expected: String, actual: String },
+    #[error("USX verse end {0:?} has no corresponding open verse")]
+    UnexpectedVerseEnd(String),
+    #[error("USX vid {actual:?} does not match open verse {expected:?}")]
+    MismatchedVerseContinuation { expected: String, actual: String },
+    #[error("USX {0} milestones must be empty elements")]
+    NonEmptyUsxMilestone(&'static str),
+    #[error("invalid style {actual:?} on USX {element}; expected {expected:?}")]
+    InvalidUsxStyle {
+        element: &'static str,
+        expected: &'static str,
+        actual: String,
+    },
     #[error("invalid passage request {request:?}: {reason}")]
     InvalidPassageRequest {
         request: PassageRequest,
@@ -480,35 +498,47 @@ fn parse_verses(path: &Path, book_code: &str) -> Result<Vec<Verse>, Error> {
     let mut current = None::<Verse>;
     let mut chapter = None::<u32>;
     let mut excluded_depth = 0_usize;
+    let mut version = None::<UsxVersion>;
+    let mut found_book = false;
 
     loop {
         match reader.read_event_into(&mut buffer)? {
             Event::Start(event) => {
+                match event.local_name().as_ref() {
+                    b"usx" => version = Some(parse_usx_version(&reader, &event)?),
+                    b"book" => {
+                        validate_book(&reader, &event, book_code)?;
+                        found_book = true;
+                    }
+                    b"chapter" => return Err(Error::NonEmptyUsxMilestone("chapter")),
+                    b"verse" => return Err(Error::NonEmptyUsxMilestone("verse")),
+                    _ => {}
+                }
+
                 if excluded_depth > 0 {
                     excluded_depth += 1;
                 } else if is_excluded(event.local_name().as_ref()) {
                     excluded_depth = 1;
                 } else {
-                    record_usx_marker(
-                        &reader,
-                        &event,
-                        book_code,
-                        &mut chapter,
-                        &mut current,
-                        &mut verses,
-                    )?;
+                    validate_vid(&reader, &event, current.as_ref())?;
                 }
             }
-            Event::Empty(event) if excluded_depth == 0 => {
-                record_usx_marker(
+            Event::Empty(event) if excluded_depth == 0 => match event.local_name().as_ref() {
+                b"book" => {
+                    validate_book(&reader, &event, book_code)?;
+                    found_book = true;
+                }
+                b"chapter" | b"verse" => record_usx_marker(
                     &reader,
                     &event,
+                    version.ok_or(Error::MissingUsxField("usx/@version"))?,
                     book_code,
                     &mut chapter,
                     &mut current,
                     &mut verses,
-                )?;
-            }
+                )?,
+                _ => validate_vid(&reader, &event, current.as_ref())?,
+            },
             Event::Text(text) if excluded_depth == 0 => {
                 if let Some(verse) = &mut current {
                     verse.text.push_str(&text.xml_content()?);
@@ -536,12 +566,127 @@ fn parse_verses(path: &Path, book_code: &str) -> Result<Vec<Verse>, Error> {
         buffer.clear();
     }
 
+    version.ok_or(Error::MissingUsxField("usx/@version"))?;
+    if !found_book {
+        return Err(Error::MissingUsxField("book/@code"));
+    }
     Ok(verses)
+}
+
+#[derive(Clone, Copy)]
+struct UsxVersion {
+    major: u8,
+}
+
+fn parse_usx_book_code(path: &Path) -> Result<String, Error> {
+    let mut reader = Reader::from_reader(BufReader::new(File::open(path)?));
+    let mut buffer = Vec::new();
+    let mut found_version = false;
+
+    loop {
+        match reader.read_event_into(&mut buffer)? {
+            Event::Start(event) | Event::Empty(event) => match event.local_name().as_ref() {
+                b"usx" => {
+                    parse_usx_version(&reader, &event)?;
+                    found_version = true;
+                }
+                b"book" => {
+                    if !found_version {
+                        return Err(Error::MissingUsxField("usx/@version"));
+                    }
+                    validate_style(&reader, &event, "book", "id")?;
+                    return attribute(&reader, &event, b"code")?
+                        .ok_or(Error::MissingUsxField("book/@code"));
+                }
+                _ => {}
+            },
+            Event::Eof => return Err(Error::MissingUsxField("book/@code")),
+            _ => {}
+        }
+        buffer.clear();
+    }
+}
+
+fn parse_usx_version(
+    reader: &Reader<BufReader<File>>,
+    event: &BytesStart<'_>,
+) -> Result<UsxVersion, Error> {
+    let value =
+        attribute(reader, event, b"version")?.ok_or(Error::MissingUsxField("usx/@version"))?;
+    let mut parts = value.split('.');
+    let major = parts.next().and_then(|part| part.parse::<u8>().ok());
+    let valid_tail = parts
+        .clone()
+        .all(|part| !part.is_empty() && part.chars().all(|c| c.is_ascii_digit()));
+    if !valid_tail || parts.count() != 1 || !matches!(major, Some(1..=3)) {
+        return Err(Error::UnsupportedUsxVersion(value));
+    }
+    Ok(UsxVersion {
+        major: major.unwrap_or_default(),
+    })
+}
+
+fn validate_book(
+    reader: &Reader<BufReader<File>>,
+    event: &BytesStart<'_>,
+    expected: &str,
+) -> Result<(), Error> {
+    validate_style(reader, event, "book", "id")?;
+    let actual = attribute(reader, event, b"code")?.ok_or(Error::MissingUsxField("book/@code"))?;
+    if actual != expected {
+        return Err(Error::MismatchedBookCode {
+            expected: expected.to_owned(),
+            actual,
+        });
+    }
+    Ok(())
+}
+
+fn validate_style(
+    reader: &Reader<BufReader<File>>,
+    event: &BytesStart<'_>,
+    element: &'static str,
+    expected: &'static str,
+) -> Result<(), Error> {
+    let style =
+        attribute(reader, event, b"style")?.ok_or(Error::MissingUsxField("element/@style"))?;
+    if style != expected {
+        return Err(Error::InvalidUsxStyle {
+            element,
+            expected,
+            actual: style,
+        });
+    }
+    Ok(())
+}
+
+fn validate_vid(
+    reader: &Reader<BufReader<File>>,
+    event: &BytesStart<'_>,
+    current: Option<&Verse>,
+) -> Result<(), Error> {
+    let Some(actual) = attribute(reader, event, b"vid")? else {
+        return Ok(());
+    };
+    let Some(current) = current else {
+        return Err(Error::MismatchedVerseContinuation {
+            expected: String::new(),
+            actual,
+        });
+    };
+    if actual != current.sid {
+        return Err(Error::MismatchedVerseContinuation {
+            expected: current.sid.clone(),
+            actual,
+        });
+    }
+    Ok(())
 }
 
 fn record_usx_marker(
     reader: &Reader<BufReader<File>>,
     event: &BytesStart<'_>,
+    version: UsxVersion,
     book_code: &str,
     chapter: &mut Option<u32>,
     current: &mut Option<Verse>,
@@ -550,7 +695,10 @@ fn record_usx_marker(
     match event.local_name().as_ref() {
         b"chapter" => {
             finish_verse(current, verses);
-            if let Some(number) = attribute(reader, event, b"number")? {
+            if attribute(reader, event, b"eid")?.is_none() {
+                validate_style(reader, event, "chapter", "c")?;
+                let number = attribute(reader, event, b"number")?
+                    .ok_or(Error::MissingUsxField("chapter/@number"))?;
                 *chapter = Some(
                     number
                         .parse()
@@ -559,27 +707,38 @@ fn record_usx_marker(
             }
         }
         b"verse" => {
-            if attribute(reader, event, b"eid")?.is_some() {
+            if let Some(actual) = attribute(reader, event, b"eid")? {
+                let Some(open) = current else {
+                    return Err(Error::UnexpectedVerseEnd(actual));
+                };
+                if open.sid != actual {
+                    return Err(Error::MismatchedVerseEnd {
+                        expected: open.sid.clone(),
+                        actual,
+                    });
+                }
                 finish_verse(current, verses);
                 return Ok(());
             }
 
-            if let Some(number) = attribute(reader, event, b"number")? {
-                finish_verse(current, verses);
-                let chapter_number = chapter.unwrap_or(0);
-                let sid = attribute(reader, event, b"sid")?.unwrap_or_else(|| {
-                    chapter.map_or_else(
-                        || format!("{book_code} {number}"),
-                        |chapter| format!("{book_code} {chapter}:{number}"),
-                    )
-                });
-                *current = Some(Verse {
-                    sid,
-                    chapter: chapter_number,
-                    number,
-                    text: String::new(),
-                });
-            }
+            validate_style(reader, event, "verse", "v")?;
+            let number = attribute(reader, event, b"number")?
+                .ok_or(Error::MissingUsxField("verse/@number"))?;
+            finish_verse(current, verses);
+            let chapter_number = chapter.ok_or(Error::MissingUsxField("chapter/@number"))?;
+            let sid = match attribute(reader, event, b"sid")? {
+                Some(sid) => sid,
+                None if version.major < 3 => format!("{book_code} {chapter_number}:{number}"),
+                None => return Err(Error::MissingUsxField("verse/@sid")),
+            };
+            *current = Some(Verse {
+                sid,
+                chapter: chapter_number,
+                number,
+                alternate_number: attribute(reader, event, b"altnumber")?,
+                published_number: attribute(reader, event, b"pubnumber")?,
+                text: String::new(),
+            });
         }
         _ => {}
     }
@@ -588,7 +747,11 @@ fn record_usx_marker(
 
 fn finish_verse(current: &mut Option<Verse>, verses: &mut Vec<Verse>) {
     if let Some(mut verse) = current.take() {
-        verse.text = verse.text.split_whitespace().collect::<Vec<_>>().join(" ");
+        verse.text = verse
+            .text
+            .split_ascii_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
         verses.push(verse);
     }
 }
@@ -598,17 +761,18 @@ fn is_excluded(name: &[u8]) -> bool {
 }
 
 fn verse_number_span(number: &str) -> Option<(u32, u32)> {
-    let start = leading_number(number)?;
-    let end = number
-        .split_once('-')
-        .and_then(|(_, end)| leading_number(end))
-        .unwrap_or(start);
-    Some((start, end))
+    let mut values = number.split(['-', ',']).filter_map(leading_number);
+    let first = values.next()?;
+    Some(values.fold((first, first), |(min, max), value| {
+        (min.min(value), max.max(value))
+    }))
 }
 
 fn leading_number(value: &str) -> Option<u32> {
     let digits = value
-        .trim_start()
+        .trim_start_matches(|character: char| {
+            character.is_ascii_whitespace() || character == '\u{200f}'
+        })
         .chars()
         .take_while(char::is_ascii_digit)
         .collect::<String>();
@@ -687,11 +851,20 @@ fn record_empty_element(
     stack: &[String],
     metadata: &mut Metadata,
 ) -> Result<(), Error> {
-    if event.local_name().as_ref() == b"resource"
+    let uri = if event.local_name().as_ref() == b"resource"
         && stack.last().is_some_and(|parent| parent == "manifest")
-        && let Some(uri) = attribute(reader, event, b"uri")?
+    {
+        attribute(reader, event, b"uri")?
+    } else if event.local_name().as_ref() == b"content" {
+        attribute(reader, event, b"src")?
+    } else {
+        None
+    };
+
+    if let Some(uri) = uri
         && uri.starts_with("release/USX_")
         && uri.ends_with(".usx")
+        && !metadata.usx_resources.contains(&uri)
     {
         metadata.usx_resources.push(uri);
     }
@@ -716,15 +889,6 @@ fn attribute(
     Ok(None)
 }
 
-fn book_code_from_uri(uri: &str) -> Option<String> {
-    Path::new(uri)
-        .file_stem()?
-        .to_str()?
-        .split('_')
-        .next()
-        .map(str::to_owned)
-}
-
 fn required(value: Option<String>, field: &'static str) -> Result<String, Error> {
     value.ok_or(Error::MissingField(field))
 }
@@ -734,10 +898,9 @@ mod tests {
     use super::*;
 
     #[test]
-    fn extracts_special_book_code_from_filename() {
-        assert_eq!(
-            book_code_from_uri("release/USX_1/PSA_Psa151inPsa.usx").as_deref(),
-            Some("PSA")
-        );
+    fn parses_usx_verse_number_sequences() {
+        assert_eq!(verse_number_span("2-6a"), Some((2, 6)));
+        assert_eq!(verse_number_span("18\u{200f},19"), Some((18, 19)));
+        assert_eq!(verse_number_span("3b"), Some((3, 3)));
     }
 }
