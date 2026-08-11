@@ -8,6 +8,8 @@
 //! abbreviation, canonicalized [`icu_locale::Locale`], writing direction, and
 //! available books. USX files are parsed on demand when [`Book::verses`] or
 //! [`DblBundle::passage`] is called.
+//! Call [`usx::book_code`] and [`usx::verses`] to parse a USX file without a
+//! DBL bundle.
 //!
 //! Passage requests are structured values rather than strings. Constructors on
 //! [`PassageRequest`] support one chapter, a chapter range, one verse, a verse
@@ -28,6 +30,9 @@
 //! # Ok(())
 //! # }
 //! ```
+
+/// Direct parsing of Unified Scripture XML documents.
+pub mod usx;
 
 use std::collections::BTreeMap;
 use std::fs::{self, File};
@@ -159,7 +164,7 @@ impl DblBundle {
             .into_iter()
             .map(|uri| {
                 let path = root.join(&uri);
-                let code = parse_usx_book_code(&path)?;
+                let code = usx::book_code(&path)?;
                 let names = metadata.book_names.get(&code).cloned().unwrap_or_default();
                 Ok(Book { code, names, path })
             })
@@ -252,7 +257,7 @@ impl Book {
     /// chapter boundary, or end of file also closes the current verse, which
     /// supports documents with omitted verse-ending milestones.
     pub fn verses(&self) -> Result<Vec<Verse>, Error> {
-        parse_verses(&self.path, &self.code)
+        usx::verses(&self.path, &self.code)
     }
 
     fn matches_name(&self, name: &str) -> bool {
@@ -406,7 +411,7 @@ impl PassageRequest {
     }
 
     fn includes(&self, verse: &Verse) -> bool {
-        let Some((verse_start, verse_end)) = verse_number_span(&verse.number) else {
+        let Some((verse_start, verse_end)) = usx::verse_number_span(&verse.number) else {
             return false;
         };
         let after_start = verse.chapter > self.start.chapter
@@ -490,6 +495,27 @@ pub enum Error {
         /// Book code declared by DBL metadata.
         expected: String,
         /// Book code found in the USX document.
+        actual: String,
+    },
+    /// A USX chapter end refers to a different chapter than the open chapter.
+    #[error("USX chapter end {actual:?} does not match open chapter {expected:?}")]
+    MismatchedChapterEnd {
+        /// Scripture identifier of the open chapter.
+        expected: String,
+        /// Scripture identifier on the chapter-ending milestone.
+        actual: String,
+    },
+    /// A chapter-ending milestone appears when no chapter is open.
+    #[error("USX chapter end {0:?} has no corresponding open chapter")]
+    UnexpectedChapterEnd(String),
+    /// A USX scripture identifier does not describe its milestone.
+    #[error("invalid {attribute} {actual:?}; expected {expected:?}")]
+    InvalidUsxIdentifier {
+        /// Attribute containing the invalid identifier.
+        attribute: &'static str,
+        /// Identifier implied by the milestone's book and number attributes.
+        expected: String,
+        /// Identifier read from the document.
         actual: String,
     },
     /// A verse-ending milestone refers to a different verse than the open verse.
@@ -614,295 +640,6 @@ fn parse_metadata(path: &Path) -> Result<Metadata, Error> {
     Ok(metadata)
 }
 
-fn parse_verses(path: &Path, book_code: &str) -> Result<Vec<Verse>, Error> {
-    let mut reader = Reader::from_reader(BufReader::new(File::open(path)?));
-    reader.config_mut().trim_text(false);
-    let mut buffer = Vec::new();
-    let mut verses = Vec::new();
-    let mut current = None::<Verse>;
-    let mut chapter = None::<u32>;
-    let mut excluded_depth = 0_usize;
-    let mut version = None::<UsxVersion>;
-    let mut found_book = false;
-
-    loop {
-        match reader.read_event_into(&mut buffer)? {
-            Event::Start(event) => {
-                match event.local_name().as_ref() {
-                    b"usx" => version = Some(parse_usx_version(&reader, &event)?),
-                    b"book" => {
-                        validate_book(&reader, &event, book_code)?;
-                        found_book = true;
-                    }
-                    b"chapter" => return Err(Error::NonEmptyUsxMilestone("chapter")),
-                    b"verse" => return Err(Error::NonEmptyUsxMilestone("verse")),
-                    _ => {}
-                }
-
-                if excluded_depth > 0 {
-                    excluded_depth += 1;
-                } else if is_excluded(event.local_name().as_ref()) {
-                    excluded_depth = 1;
-                } else {
-                    validate_vid(&reader, &event, current.as_ref())?;
-                }
-            }
-            Event::Empty(event) if excluded_depth == 0 => match event.local_name().as_ref() {
-                b"book" => {
-                    validate_book(&reader, &event, book_code)?;
-                    found_book = true;
-                }
-                b"chapter" | b"verse" => record_usx_marker(
-                    &reader,
-                    &event,
-                    version.ok_or(Error::MissingUsxField("usx/@version"))?,
-                    book_code,
-                    &mut chapter,
-                    &mut current,
-                    &mut verses,
-                )?,
-                _ => validate_vid(&reader, &event, current.as_ref())?,
-            },
-            Event::Text(text) if excluded_depth == 0 => {
-                if let Some(verse) = &mut current {
-                    verse.text.push_str(&text.xml_content()?);
-                }
-            }
-            Event::CData(text) if excluded_depth == 0 => {
-                if let Some(verse) = &mut current {
-                    verse.text.push_str(&text.decode()?);
-                }
-            }
-            Event::GeneralRef(reference) if excluded_depth == 0 => {
-                if let Some(verse) = &mut current {
-                    let reference = reference.decode()?;
-                    let escaped = format!("&{reference};");
-                    verse.text.push_str(&unescape(&escaped)?);
-                }
-            }
-            Event::End(_) if excluded_depth > 0 => excluded_depth -= 1,
-            Event::Eof => {
-                finish_verse(&mut current, &mut verses);
-                break;
-            }
-            _ => {}
-        }
-        buffer.clear();
-    }
-
-    version.ok_or(Error::MissingUsxField("usx/@version"))?;
-    if !found_book {
-        return Err(Error::MissingUsxField("book/@code"));
-    }
-    Ok(verses)
-}
-
-#[derive(Clone, Copy)]
-struct UsxVersion {
-    major: u8,
-}
-
-fn parse_usx_book_code(path: &Path) -> Result<String, Error> {
-    let mut reader = Reader::from_reader(BufReader::new(File::open(path)?));
-    let mut buffer = Vec::new();
-    let mut found_version = false;
-
-    loop {
-        match reader.read_event_into(&mut buffer)? {
-            Event::Start(event) | Event::Empty(event) => match event.local_name().as_ref() {
-                b"usx" => {
-                    parse_usx_version(&reader, &event)?;
-                    found_version = true;
-                }
-                b"book" => {
-                    if !found_version {
-                        return Err(Error::MissingUsxField("usx/@version"));
-                    }
-                    validate_style(&reader, &event, "book", "id")?;
-                    return attribute(&reader, &event, b"code")?
-                        .ok_or(Error::MissingUsxField("book/@code"));
-                }
-                _ => {}
-            },
-            Event::Eof => return Err(Error::MissingUsxField("book/@code")),
-            _ => {}
-        }
-        buffer.clear();
-    }
-}
-
-fn parse_usx_version(
-    reader: &Reader<BufReader<File>>,
-    event: &BytesStart<'_>,
-) -> Result<UsxVersion, Error> {
-    let value =
-        attribute(reader, event, b"version")?.ok_or(Error::MissingUsxField("usx/@version"))?;
-    let mut parts = value.split('.');
-    let major = parts.next().and_then(|part| part.parse::<u8>().ok());
-    let valid_tail = parts
-        .clone()
-        .all(|part| !part.is_empty() && part.chars().all(|c| c.is_ascii_digit()));
-    if !valid_tail || parts.count() != 1 || !matches!(major, Some(1..=3)) {
-        return Err(Error::UnsupportedUsxVersion(value));
-    }
-    Ok(UsxVersion {
-        major: major.unwrap_or_default(),
-    })
-}
-
-fn validate_book(
-    reader: &Reader<BufReader<File>>,
-    event: &BytesStart<'_>,
-    expected: &str,
-) -> Result<(), Error> {
-    validate_style(reader, event, "book", "id")?;
-    let actual = attribute(reader, event, b"code")?.ok_or(Error::MissingUsxField("book/@code"))?;
-    if actual != expected {
-        return Err(Error::MismatchedBookCode {
-            expected: expected.to_owned(),
-            actual,
-        });
-    }
-    Ok(())
-}
-
-fn validate_style(
-    reader: &Reader<BufReader<File>>,
-    event: &BytesStart<'_>,
-    element: &'static str,
-    expected: &'static str,
-) -> Result<(), Error> {
-    let style =
-        attribute(reader, event, b"style")?.ok_or(Error::MissingUsxField("element/@style"))?;
-    if style != expected {
-        return Err(Error::InvalidUsxStyle {
-            element,
-            expected,
-            actual: style,
-        });
-    }
-    Ok(())
-}
-
-fn validate_vid(
-    reader: &Reader<BufReader<File>>,
-    event: &BytesStart<'_>,
-    current: Option<&Verse>,
-) -> Result<(), Error> {
-    let Some(actual) = attribute(reader, event, b"vid")? else {
-        return Ok(());
-    };
-    let Some(current) = current else {
-        return Err(Error::MismatchedVerseContinuation {
-            expected: String::new(),
-            actual,
-        });
-    };
-    if actual != current.sid {
-        return Err(Error::MismatchedVerseContinuation {
-            expected: current.sid.clone(),
-            actual,
-        });
-    }
-    Ok(())
-}
-
-fn record_usx_marker(
-    reader: &Reader<BufReader<File>>,
-    event: &BytesStart<'_>,
-    version: UsxVersion,
-    book_code: &str,
-    chapter: &mut Option<u32>,
-    current: &mut Option<Verse>,
-    verses: &mut Vec<Verse>,
-) -> Result<(), Error> {
-    match event.local_name().as_ref() {
-        b"chapter" => {
-            finish_verse(current, verses);
-            if attribute(reader, event, b"eid")?.is_none() {
-                validate_style(reader, event, "chapter", "c")?;
-                let number = attribute(reader, event, b"number")?
-                    .ok_or(Error::MissingUsxField("chapter/@number"))?;
-                *chapter = Some(
-                    number
-                        .parse()
-                        .map_err(|_| Error::InvalidChapterNumber(number))?,
-                );
-            }
-        }
-        b"verse" => {
-            if let Some(actual) = attribute(reader, event, b"eid")? {
-                let Some(open) = current else {
-                    return Err(Error::UnexpectedVerseEnd(actual));
-                };
-                if open.sid != actual {
-                    return Err(Error::MismatchedVerseEnd {
-                        expected: open.sid.clone(),
-                        actual,
-                    });
-                }
-                finish_verse(current, verses);
-                return Ok(());
-            }
-
-            validate_style(reader, event, "verse", "v")?;
-            let number = attribute(reader, event, b"number")?
-                .ok_or(Error::MissingUsxField("verse/@number"))?;
-            finish_verse(current, verses);
-            let chapter_number = chapter.ok_or(Error::MissingUsxField("chapter/@number"))?;
-            let sid = match attribute(reader, event, b"sid")? {
-                Some(sid) => sid,
-                None if version.major < 3 => format!("{book_code} {chapter_number}:{number}"),
-                None => return Err(Error::MissingUsxField("verse/@sid")),
-            };
-            *current = Some(Verse {
-                sid,
-                chapter: chapter_number,
-                number,
-                alternate_number: attribute(reader, event, b"altnumber")?,
-                published_number: attribute(reader, event, b"pubnumber")?,
-                text: String::new(),
-            });
-        }
-        _ => {}
-    }
-    Ok(())
-}
-
-fn finish_verse(current: &mut Option<Verse>, verses: &mut Vec<Verse>) {
-    if let Some(mut verse) = current.take() {
-        verse.text = verse
-            .text
-            .split_ascii_whitespace()
-            .collect::<Vec<_>>()
-            .join(" ");
-        verses.push(verse);
-    }
-}
-
-fn is_excluded(name: &[u8]) -> bool {
-    matches!(name, b"note" | b"figure" | b"sidebar")
-}
-
-fn verse_number_span(number: &str) -> Option<(u32, u32)> {
-    let mut values = number.split(['-', ',']).filter_map(leading_number);
-    let first = values.next()?;
-    Some(values.fold((first, first), |(min, max), value| {
-        (min.min(value), max.max(value))
-    }))
-}
-
-fn leading_number(value: &str) -> Option<u32> {
-    let digits = value
-        .trim_start_matches(|character: char| {
-            character.is_ascii_whitespace() || character == '\u{200f}'
-        })
-        .chars()
-        .take_while(char::is_ascii_digit)
-        .collect::<String>();
-    (!digits.is_empty()).then(|| digits.parse().ok()).flatten()
-}
-
 fn record_text(stack: &[String], value: &str, current_book: Option<&str>, metadata: &mut Metadata) {
     let path = stack.iter().map(String::as_str).collect::<Vec<_>>();
     match path.as_slice() {
@@ -1015,16 +752,4 @@ fn attribute(
 
 fn required(value: Option<String>, field: &'static str) -> Result<String, Error> {
     value.ok_or(Error::MissingField(field))
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn parses_usx_verse_number_sequences() {
-        assert_eq!(verse_number_span("2-6a"), Some((2, 6)));
-        assert_eq!(verse_number_span("18\u{200f},19"), Some((18, 19)));
-        assert_eq!(verse_number_span("3b"), Some((3, 3)));
-    }
 }

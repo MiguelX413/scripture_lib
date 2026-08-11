@@ -1,7 +1,7 @@
 use std::fs;
 use std::path::PathBuf;
 
-use scripture_lib::{PassageRequest, ScriptDirection, ScriptureLibrary};
+use scripture_lib::{Error, PassageRequest, ScriptDirection, ScriptureLibrary, usx};
 
 struct TestDirectory(PathBuf);
 
@@ -96,6 +96,36 @@ fn discovers_and_reads_a_dbl_folder() {
 </usx>"#,
     )
     .unwrap();
+    let patch_version_path = directory.0.join("patch-version.usx");
+    fs::write(
+        &patch_version_path,
+        r#"<usx version="3.0.8">
+  <book code="MAT" style="id" />
+  <chapter number="1" style="c" sid="MAT 1" />
+  <para style="p"><verse number="1" style="v" sid="MAT 1:1" />Text.<verse eid="MAT 1:1" /></para>
+  <chapter eid="MAT 1" />
+</usx>"#,
+    )
+    .unwrap();
+    let missing_chapter_sid_path = directory.0.join("missing-chapter-sid.usx");
+    fs::write(
+        &missing_chapter_sid_path,
+        r#"<usx version="3.1">
+  <book code="MAT" style="id" />
+  <chapter number="1" style="c" />
+</usx>"#,
+    )
+    .unwrap();
+    let mismatched_chapter_end_path = directory.0.join("mismatched-chapter-end.usx");
+    fs::write(
+        &mismatched_chapter_end_path,
+        r#"<usx version="3.1">
+  <book code="MAT" style="id" />
+  <chapter number="1" style="c" sid="MAT 1" />
+  <chapter eid="MAT 2" />
+</usx>"#,
+    )
+    .unwrap();
 
     let library = ScriptureLibrary::discover(&directory.0).unwrap();
     assert_eq!(library.bundles().len(), 1);
@@ -113,8 +143,20 @@ fn discovers_and_reads_a_dbl_folder() {
     let genesis = bundle.book("gen").unwrap();
     assert_eq!(genesis.names.long.as_deref(), Some("Genesis"));
     assert!(genesis.read_usx().unwrap().contains("<usx"));
+    assert_eq!(usx::book_code(genesis.path()).unwrap(), "GEN");
+    assert_eq!(usx::book_code(&patch_version_path).unwrap(), "MAT");
+    assert_eq!(usx::verses(&patch_version_path, "MAT").unwrap().len(), 1);
+    assert!(matches!(
+        usx::verses(&missing_chapter_sid_path, "MAT"),
+        Err(Error::MissingUsxField("chapter/@sid"))
+    ));
+    assert!(matches!(
+        usx::verses(&mismatched_chapter_end_path, "MAT"),
+        Err(Error::MismatchedChapterEnd { .. })
+    ));
 
     let verses = genesis.verses().unwrap();
+    assert_eq!(usx::verses(genesis.path(), "GEN").unwrap(), verses);
     assert_eq!(verses.len(), 8);
     assert_eq!(verses[0].sid, "GEN 1:1");
     assert_eq!(verses[0].text, "First & added.");
