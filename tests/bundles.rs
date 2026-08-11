@@ -1,7 +1,7 @@
 use std::fs;
 use std::path::PathBuf;
 
-use scripture_lib::{Error, PassageRequest, ScriptDirection, ScriptureLibrary, usx};
+use scripture_lib::{Error, PassageRange, PassageRequest, ScriptDirection, ScriptureLibrary, usx};
 
 struct TestDirectory(PathBuf);
 
@@ -18,6 +18,24 @@ impl Drop for TestDirectory {
     fn drop(&mut self) {
         let _ = fs::remove_dir_all(&self.0);
     }
+}
+
+#[test]
+fn passage_requests_are_valid_by_construction() {
+    assert!(PassageRequest::chapter("", 1).is_err());
+    assert!(PassageRequest::chapter("Genesis", 0).is_err());
+    assert!(PassageRequest::chapters("Genesis", 2, 1).is_err());
+    assert!(PassageRequest::verse("Genesis", 1, 0).is_err());
+    assert!(PassageRequest::verses("Genesis", 1, 5, 4).is_err());
+    assert!(PassageRequest::verse_range("Genesis", 2, 1, 1, 10).is_err());
+
+    let request = PassageRequest::verse_range("Genesis", 1, 4, 2, 3).unwrap();
+    assert_eq!(request.book(), "Genesis");
+    let PassageRange::Verses { start, end } = request.range() else {
+        panic!("expected a verse range");
+    };
+    assert_eq!((start.chapter(), start.verse()), (1, 4));
+    assert_eq!((end.chapter(), end.verse()), (2, 3));
 }
 
 #[test]
@@ -181,7 +199,7 @@ fn discovers_and_reads_a_dbl_folder() {
 
     assert_eq!(
         bundle
-            .passage(&PassageRequest::chapter("Genesis", 1))
+            .passage(&PassageRequest::chapter("Genesis", 1).unwrap())
             .unwrap()
             .verses
             .len(),
@@ -189,7 +207,7 @@ fn discovers_and_reads_a_dbl_folder() {
     );
     assert_eq!(
         bundle
-            .passage(&PassageRequest::chapters("Genesis", 1, 2))
+            .passage(&PassageRequest::chapters("Genesis", 1, 2).unwrap())
             .unwrap()
             .verses
             .len(),
@@ -197,14 +215,14 @@ fn discovers_and_reads_a_dbl_folder() {
     );
     assert_eq!(
         bundle
-            .passage(&PassageRequest::verse("GEN", 1, 4))
+            .passage(&PassageRequest::verse("GEN", 1, 4).unwrap())
             .unwrap()
             .text(),
         "Fourth, with neither milestone."
     );
     assert_eq!(
         bundle
-            .passage(&PassageRequest::verses("Genesis", 1, 4, 5))
+            .passage(&PassageRequest::verses("Genesis", 1, 4, 5).unwrap())
             .unwrap()
             .verses
             .len(),
@@ -212,14 +230,14 @@ fn discovers_and_reads_a_dbl_folder() {
     );
     assert_eq!(
         bundle
-            .passage(&PassageRequest::verse("Genesis", 1, 6))
+            .passage(&PassageRequest::verse("Genesis", 1, 6).unwrap())
             .unwrap()
             .verses[0]
             .number,
         "5-6"
     );
     let cross_chapter = bundle
-        .passage(&PassageRequest::verse_range("Genesis", 1, 4, 2, 3))
+        .passage(&PassageRequest::verse_range("Genesis", 1, 4, 2, 3).unwrap())
         .unwrap();
     assert_eq!(cross_chapter.verses.len(), 5);
     assert_eq!(cross_chapter.verses.first().unwrap().sid, "GEN 1:4");

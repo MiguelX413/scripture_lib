@@ -14,7 +14,7 @@ let english = library.get("engLXXup").expect("English bundle");
 let genesis = english.book("GEN").expect("Genesis");
 println!("{}: {}", english.locale, genesis.names.long.as_deref().unwrap_or("GEN"));
 
-let request = PassageRequest::verse_range("Genesis", 1, 4, 2, 3);
+let request = PassageRequest::verse_range("Genesis", 1, 4, 2, 3)?;
 println!("{}", english.passage(&request)?.text());
 # Ok::<(), scripture_lib::Error>(())
 ```

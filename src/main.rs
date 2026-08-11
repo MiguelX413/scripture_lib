@@ -67,7 +67,7 @@ fn run_console(library: &ScriptureLibrary) -> io::Result<()> {
         };
         match bundle.passage(&query.passage) {
             Ok(passage) => {
-                println!("{} {}", bundle.abbreviation, query.passage.book);
+                println!("{} {}", bundle.abbreviation, query.passage.book());
                 for verse in passage.verses {
                     println!("{}:{}\t{}", verse.chapter, verse.number, verse.text);
                 }
@@ -107,10 +107,11 @@ fn parse_query(input: &str) -> Result<Query, String> {
 fn parse_reference(book: String, reference: &str) -> Result<PassageRequest, String> {
     let Some((start, end)) = reference.split_once('-') else {
         let start = parse_point(reference)?;
-        return Ok(match start.verse {
+        return match start.verse {
             Some(verse) => PassageRequest::verse(book, start.chapter, verse),
             None => PassageRequest::chapter(book, start.chapter),
-        });
+        }
+        .map_err(|error| error.to_string());
     };
     if end.contains('-') {
         return Err("a passage can contain only one range separator".to_owned());
@@ -123,28 +124,20 @@ fn parse_reference(book: String, reference: &str) -> Result<PassageRequest, Stri
             let end_verse = end
                 .verse
                 .ok_or_else(|| "the ending verse is missing".to_owned())?;
-            Ok(PassageRequest::verse_range(
-                book,
-                start.chapter,
-                start_verse,
-                end.chapter,
-                end_verse,
-            ))
+            PassageRequest::verse_range(book, start.chapter, start_verse, end.chapter, end_verse)
+                .map_err(|error| error.to_string())
         } else {
             let end_verse = parse_positive_number(end, "verse")?;
-            Ok(PassageRequest::verses(
-                book,
-                start.chapter,
-                start_verse,
-                end_verse,
-            ))
+            PassageRequest::verses(book, start.chapter, start_verse, end_verse)
+                .map_err(|error| error.to_string())
         }
     } else {
         let end = parse_point(end)?;
         if end.verse.is_some() {
             return Err("a chapter range cannot end at a verse".to_owned());
         }
-        Ok(PassageRequest::chapters(book, start.chapter, end.chapter))
+        PassageRequest::chapters(book, start.chapter, end.chapter)
+            .map_err(|error| error.to_string())
     }
 }
 
@@ -188,25 +181,25 @@ mod tests {
     fn parses_supported_console_requests() {
         assert_eq!(
             parse_query("Genesis 1 LXXUP").unwrap().passage,
-            PassageRequest::chapter("Genesis", 1)
+            PassageRequest::chapter("Genesis", 1).unwrap()
         );
         assert_eq!(
             parse_query("Genesis 1-2 LXXUP").unwrap().passage,
-            PassageRequest::chapters("Genesis", 1, 2)
+            PassageRequest::chapters("Genesis", 1, 2).unwrap()
         );
         assert_eq!(
             parse_query("Genesis 1:4 LXXUP").unwrap().passage,
-            PassageRequest::verse("Genesis", 1, 4)
+            PassageRequest::verse("Genesis", 1, 4).unwrap()
         );
         assert_eq!(
             parse_query("Genesis 1:4-5 LXXUP").unwrap().passage,
-            PassageRequest::verses("Genesis", 1, 4, 5)
+            PassageRequest::verses("Genesis", 1, 4, 5).unwrap()
         );
         assert_eq!(
             parse_query("Genesis 1:2-3:4 LXXUP").unwrap(),
             Query {
                 bundle: "LXXUP".to_owned(),
-                passage: PassageRequest::verse_range("Genesis", 1, 2, 3, 4),
+                passage: PassageRequest::verse_range("Genesis", 1, 2, 3, 4).unwrap(),
             }
         );
     }

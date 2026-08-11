@@ -23,7 +23,7 @@
 //! # fn main() -> Result<(), scripture_lib::Error> {
 //! let library = ScriptureLibrary::discover("offline")?;
 //! let bundle = library.get("LXXUP").expect("LXXUP bundle is installed");
-//! let request = PassageRequest::verse_range("Genesis", 1, 2, 3, 4);
+//! let request = PassageRequest::verse_range("Genesis", 1, 2, 3, 4)?;
 //! let passage = bundle.passage(&request)?;
 //!
 //! println!("{}", passage.text());
@@ -213,8 +213,8 @@ impl DblBundle {
         let book = self
             .books
             .iter()
-            .find(|book| book.matches_name(&request.book))
-            .ok_or_else(|| Error::BookNotFound(request.book.clone()))?;
+            .find(|book| book.matches_name(request.book()))
+            .ok_or_else(|| Error::BookNotFound(request.book().to_owned()))?;
         book.request_passage(request)
     }
 }
@@ -273,13 +273,6 @@ impl Book {
     }
 
     fn request_passage(&self, request: &PassageRequest) -> Result<Passage, Error> {
-        if !request.is_valid() {
-            return Err(Error::InvalidPassageRequest {
-                request: request.clone(),
-                reason: "locations must be nonzero, consistently scoped, and ordered",
-            });
-        }
-
         let verses = self
             .verses()?
             .into_iter()
@@ -313,54 +306,99 @@ pub struct Verse {
     pub text: String,
 }
 
-/// One endpoint in a passage request. `verse: None` means the whole chapter.
+/// A chapter and verse location in a passage request.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct PassagePoint {
-    /// One-based chapter number.
-    pub chapter: u32,
-    /// One-based verse number, or `None` when the endpoint is a whole chapter.
-    pub verse: Option<u32>,
+pub struct VerseReference {
+    chapter: u32,
+    verse: u32,
 }
 
-/// A parsed passage request, including its book name or USX code.
+impl VerseReference {
+    /// Returns the one-based chapter number.
+    pub fn chapter(self) -> u32 {
+        self.chapter
+    }
+
+    /// Returns the one-based verse number.
+    pub fn verse(self) -> u32 {
+        self.verse
+    }
+}
+
+/// The locations covered by a passage request.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PassageRange {
+    /// An inclusive range of whole chapters.
+    Chapters {
+        /// First one-based chapter number.
+        start: u32,
+        /// Last one-based chapter number.
+        end: u32,
+    },
+    /// An inclusive range of verses, possibly spanning chapters.
+    Verses {
+        /// First verse in the range.
+        start: VerseReference,
+        /// Last verse in the range.
+        end: VerseReference,
+    },
+}
+
+/// A validated passage request, including its book name or USX code.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PassageRequest {
-    /// USX book code or a book name or abbreviation declared by the bundle.
-    pub book: String,
-    /// Inclusive start of the requested passage.
-    pub start: PassagePoint,
-    /// Inclusive end of the requested passage.
-    pub end: PassagePoint,
+    book: String,
+    range: PassageRange,
 }
 
 impl PassageRequest {
     /// Requests one whole chapter, such as `Genesis 1`.
-    pub fn chapter(book: impl Into<String>, chapter: u32) -> Self {
+    pub fn chapter(book: impl Into<String>, chapter: u32) -> Result<Self, InvalidPassageRequest> {
         Self::chapters(book, chapter, chapter)
     }
 
     /// Requests an inclusive range of whole chapters, such as `Genesis 1-2`.
-    pub fn chapters(book: impl Into<String>, start_chapter: u32, end_chapter: u32) -> Self {
-        Self {
-            book: book.into(),
-            start: PassagePoint {
-                chapter: start_chapter,
-                verse: None,
-            },
-            end: PassagePoint {
-                chapter: end_chapter,
-                verse: None,
-            },
+    pub fn chapters(
+        book: impl Into<String>,
+        start_chapter: u32,
+        end_chapter: u32,
+    ) -> Result<Self, InvalidPassageRequest> {
+        let book = validate_book_name(book.into())?;
+        if start_chapter == 0 || end_chapter == 0 {
+            return Err(InvalidPassageRequest::new(
+                "chapter numbers must be greater than zero",
+            ));
         }
+        if start_chapter > end_chapter {
+            return Err(InvalidPassageRequest::new(
+                "the start chapter must not follow the end chapter",
+            ));
+        }
+        Ok(Self {
+            book,
+            range: PassageRange::Chapters {
+                start: start_chapter,
+                end: end_chapter,
+            },
+        })
     }
 
     /// Requests one verse, such as `Genesis 1:4`.
-    pub fn verse(book: impl Into<String>, chapter: u32, verse: u32) -> Self {
+    pub fn verse(
+        book: impl Into<String>,
+        chapter: u32,
+        verse: u32,
+    ) -> Result<Self, InvalidPassageRequest> {
         Self::verse_range(book, chapter, verse, chapter, verse)
     }
 
     /// Requests an inclusive verse range in one chapter, such as `Genesis 1:4-5`.
-    pub fn verses(book: impl Into<String>, chapter: u32, start_verse: u32, end_verse: u32) -> Self {
+    pub fn verses(
+        book: impl Into<String>,
+        chapter: u32,
+        start_verse: u32,
+        end_verse: u32,
+    ) -> Result<Self, InvalidPassageRequest> {
         Self::verse_range(book, chapter, start_verse, chapter, end_verse)
     }
 
@@ -374,53 +412,82 @@ impl PassageRequest {
         start_verse: u32,
         end_chapter: u32,
         end_verse: u32,
-    ) -> Self {
-        Self {
-            book: book.into(),
-            start: PassagePoint {
-                chapter: start_chapter,
-                verse: Some(start_verse),
-            },
-            end: PassagePoint {
-                chapter: end_chapter,
-                verse: Some(end_verse),
-            },
+    ) -> Result<Self, InvalidPassageRequest> {
+        let book = validate_book_name(book.into())?;
+        if [start_chapter, start_verse, end_chapter, end_verse].contains(&0) {
+            return Err(InvalidPassageRequest::new(
+                "chapter and verse numbers must be greater than zero",
+            ));
         }
+        if (start_chapter, start_verse) > (end_chapter, end_verse) {
+            return Err(InvalidPassageRequest::new(
+                "the start verse must not follow the end verse",
+            ));
+        }
+        Ok(Self {
+            book,
+            range: PassageRange::Verses {
+                start: VerseReference {
+                    chapter: start_chapter,
+                    verse: start_verse,
+                },
+                end: VerseReference {
+                    chapter: end_chapter,
+                    verse: end_verse,
+                },
+            },
+        })
     }
 
-    fn is_valid(&self) -> bool {
-        if self.book.is_empty()
-            || self.start.chapter == 0
-            || self.end.chapter == 0
-            || self.start.chapter > self.end.chapter
-        {
-            return false;
-        }
-        if self.start.chapter == self.end.chapter {
-            match (self.start.verse, self.end.verse) {
-                (Some(start), Some(end)) => start > 0 && start <= end,
-                (None, None) => true,
-                _ => false,
-            }
-        } else {
-            matches!(
-                (self.start.verse, self.end.verse),
-                (Some(start), Some(end)) if start > 0 && end > 0
-            ) || matches!((self.start.verse, self.end.verse), (None, None))
-        }
+    /// Returns the requested USX book code, name, or abbreviation.
+    pub fn book(&self) -> &str {
+        &self.book
+    }
+
+    /// Returns the validated range covered by this request.
+    pub fn range(&self) -> PassageRange {
+        self.range
     }
 
     fn includes(&self, verse: &Verse) -> bool {
         let Some((verse_start, verse_end)) = usx::verse_number_span(&verse.number) else {
             return false;
         };
-        let after_start = verse.chapter > self.start.chapter
-            || (verse.chapter == self.start.chapter
-                && self.start.verse.is_none_or(|start| verse_end >= start));
-        let before_end = verse.chapter < self.end.chapter
-            || (verse.chapter == self.end.chapter
-                && self.end.verse.is_none_or(|end| verse_start <= end));
-        after_start && before_end
+        match self.range {
+            PassageRange::Chapters { start, end } => (start..=end).contains(&verse.chapter),
+            PassageRange::Verses { start, end } => {
+                (verse.chapter, verse_end) >= (start.chapter, start.verse)
+                    && (verse.chapter, verse_start) <= (end.chapter, end.verse)
+            }
+        }
+    }
+}
+
+fn validate_book_name(book: String) -> Result<String, InvalidPassageRequest> {
+    if book.trim().is_empty() {
+        Err(InvalidPassageRequest::new(
+            "the book name must not be empty",
+        ))
+    } else {
+        Ok(book)
+    }
+}
+
+/// The reason a passage request could not be constructed.
+#[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
+#[error("invalid passage request: {reason}")]
+pub struct InvalidPassageRequest {
+    reason: &'static str,
+}
+
+impl InvalidPassageRequest {
+    fn new(reason: &'static str) -> Self {
+        Self { reason }
+    }
+
+    /// Returns the violated request invariant.
+    pub fn reason(self) -> &'static str {
+        self.reason
     }
 }
 
@@ -469,6 +536,9 @@ pub enum Error {
     /// An XML character or entity reference was invalid.
     #[error("could not unescape XML text: {0}")]
     XmlEscape(#[from] quick_xml::escape::EscapeError),
+    /// A passage request violates its construction invariants.
+    #[error(transparent)]
+    InvalidPassageRequest(#[from] InvalidPassageRequest),
     /// The requested directory does not contain `metadata.xml`.
     #[error("DBL bundle at {0} has no metadata.xml")]
     MissingMetadata(PathBuf),
@@ -549,14 +619,6 @@ pub enum Error {
         expected: &'static str,
         /// Style read from the document.
         actual: String,
-    },
-    /// A structured request contains invalid or inconsistent endpoints.
-    #[error("invalid passage request {request:?}: {reason}")]
-    InvalidPassageRequest {
-        /// Rejected request.
-        request: PassageRequest,
-        /// Explanation of the violated request invariant.
-        reason: &'static str,
     },
     /// No book in the bundle matches the requested name or code.
     #[error("book {0:?} was not found in this bundle")]
