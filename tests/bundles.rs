@@ -1,7 +1,7 @@
 use std::fs;
 use std::path::PathBuf;
 
-use scripture_lib::{ScriptDirection, ScriptureLibrary};
+use scripture_lib::{PassageRequest, ScriptDirection, ScriptureLibrary};
 
 struct TestDirectory(PathBuf);
 
@@ -59,6 +59,14 @@ fn discovers_and_reads_a_dbl_folder() {
     <verse number="2" style="v" sid="GEN 1:2" />Second.<verse eid="GEN 1:2" />
     <verse number="3" style="v" sid="GEN 1:3" />Third, with no end.
     <verse number="4" style="v" />Fourth, with neither milestone.
+    <verse number="5-6" style="v" />Fifth and sixth.
+  </para>
+  <chapter eid="GEN 1" />
+  <chapter number="2" style="c" sid="GEN 2" />
+  <para style="p">
+    <verse number="1" style="v" sid="GEN 2:1" />Chapter two, first.
+    <verse number="2" style="v" sid="GEN 2:2" />Chapter two, second.
+    <verse number="3" style="v" sid="GEN 2:3" />Chapter two, third.
   </para>
 </usx>"#,
     )
@@ -82,11 +90,57 @@ fn discovers_and_reads_a_dbl_folder() {
     assert!(genesis.read_usx().unwrap().contains("<usx"));
 
     let verses = genesis.verses().unwrap();
-    assert_eq!(verses.len(), 4);
+    assert_eq!(verses.len(), 8);
     assert_eq!(verses[0].sid, "GEN 1:1");
     assert_eq!(verses[0].text, "First & added.");
     assert_eq!(verses[1].text, "Second.");
     assert_eq!(verses[2].text, "Third, with no end.");
     assert_eq!(verses[3].sid, "GEN 1:4");
     assert_eq!(verses[3].text, "Fourth, with neither milestone.");
+
+    assert_eq!(
+        bundle
+            .passage(&PassageRequest::chapter("Genesis", 1))
+            .unwrap()
+            .verses
+            .len(),
+        5
+    );
+    assert_eq!(
+        bundle
+            .passage(&PassageRequest::chapters("Genesis", 1, 2))
+            .unwrap()
+            .verses
+            .len(),
+        8
+    );
+    assert_eq!(
+        bundle
+            .passage(&PassageRequest::verse("GEN", 1, 4))
+            .unwrap()
+            .text(),
+        "Fourth, with neither milestone."
+    );
+    assert_eq!(
+        bundle
+            .passage(&PassageRequest::verses("Genesis", 1, 4, 5))
+            .unwrap()
+            .verses
+            .len(),
+        2
+    );
+    assert_eq!(
+        bundle
+            .passage(&PassageRequest::verse("Genesis", 1, 6))
+            .unwrap()
+            .verses[0]
+            .number,
+        "5-6"
+    );
+    let cross_chapter = bundle
+        .passage(&PassageRequest::verse_range("Genesis", 1, 4, 2, 3))
+        .unwrap();
+    assert_eq!(cross_chapter.verses.len(), 5);
+    assert_eq!(cross_chapter.verses.first().unwrap().sid, "GEN 1:4");
+    assert_eq!(cross_chapter.verses.last().unwrap().sid, "GEN 2:3");
 }

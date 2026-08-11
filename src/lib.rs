@@ -152,6 +152,19 @@ impl DblBundle {
             .iter()
             .find(|book| book.code.eq_ignore_ascii_case(code))
     }
+
+    /// Resolves a structured passage request against this bundle.
+    ///
+    /// The request's book can be a USX code or any book abbreviation, short
+    /// name, or long name declared by this bundle.
+    pub fn passage(&self, request: &PassageRequest) -> Result<Passage, Error> {
+        let book = self
+            .books
+            .iter()
+            .find(|book| book.matches_name(&request.book))
+            .ok_or_else(|| Error::BookNotFound(request.book.clone()))?;
+        book.request_passage(request)
+    }
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -186,6 +199,41 @@ impl Book {
     pub fn verses(&self) -> Result<Vec<Verse>, Error> {
         parse_verses(&self.path, &self.code)
     }
+
+    fn matches_name(&self, name: &str) -> bool {
+        self.code.eq_ignore_ascii_case(name)
+            || [
+                self.names.abbreviation.as_deref(),
+                self.names.short.as_deref(),
+                self.names.long.as_deref(),
+            ]
+            .into_iter()
+            .flatten()
+            .any(|candidate| candidate.eq_ignore_ascii_case(name))
+    }
+
+    fn request_passage(&self, request: &PassageRequest) -> Result<Passage, Error> {
+        if !request.is_valid() {
+            return Err(Error::InvalidPassageRequest {
+                request: request.clone(),
+                reason: "locations must be nonzero, consistently scoped, and ordered",
+            });
+        }
+
+        let verses = self
+            .verses()?
+            .into_iter()
+            .filter(|verse| request.includes(verse))
+            .collect::<Vec<_>>();
+        if verses.is_empty() {
+            return Err(Error::PassageNotFound(request.clone()));
+        }
+
+        Ok(Passage {
+            request: request.clone(),
+            verses,
+        })
+    }
 }
 
 /// Plain scripture text associated with one USX verse milestone.
@@ -193,9 +241,126 @@ impl Book {
 pub struct Verse {
     /// USX scripture reference, such as `GEN 1:1`.
     pub sid: String,
+    pub chapter: u32,
     /// The displayed verse number, which may be a bridge such as `1-2`.
     pub number: String,
     pub text: String,
+}
+
+/// One endpoint in a passage request. `verse: None` means the whole chapter.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PassagePoint {
+    pub chapter: u32,
+    pub verse: Option<u32>,
+}
+
+/// A parsed passage request, including its book name or USX code.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PassageRequest {
+    pub book: String,
+    pub start: PassagePoint,
+    pub end: PassagePoint,
+}
+
+impl PassageRequest {
+    pub fn chapter(book: impl Into<String>, chapter: u32) -> Self {
+        Self::chapters(book, chapter, chapter)
+    }
+
+    pub fn chapters(book: impl Into<String>, start_chapter: u32, end_chapter: u32) -> Self {
+        Self {
+            book: book.into(),
+            start: PassagePoint {
+                chapter: start_chapter,
+                verse: None,
+            },
+            end: PassagePoint {
+                chapter: end_chapter,
+                verse: None,
+            },
+        }
+    }
+
+    pub fn verse(book: impl Into<String>, chapter: u32, verse: u32) -> Self {
+        Self::verse_range(book, chapter, verse, chapter, verse)
+    }
+
+    pub fn verses(book: impl Into<String>, chapter: u32, start_verse: u32, end_verse: u32) -> Self {
+        Self::verse_range(book, chapter, start_verse, chapter, end_verse)
+    }
+
+    pub fn verse_range(
+        book: impl Into<String>,
+        start_chapter: u32,
+        start_verse: u32,
+        end_chapter: u32,
+        end_verse: u32,
+    ) -> Self {
+        Self {
+            book: book.into(),
+            start: PassagePoint {
+                chapter: start_chapter,
+                verse: Some(start_verse),
+            },
+            end: PassagePoint {
+                chapter: end_chapter,
+                verse: Some(end_verse),
+            },
+        }
+    }
+
+    fn is_valid(&self) -> bool {
+        if self.book.is_empty()
+            || self.start.chapter == 0
+            || self.end.chapter == 0
+            || self.start.chapter > self.end.chapter
+        {
+            return false;
+        }
+        if self.start.chapter == self.end.chapter {
+            match (self.start.verse, self.end.verse) {
+                (Some(start), Some(end)) => start > 0 && start <= end,
+                (None, None) => true,
+                _ => false,
+            }
+        } else {
+            matches!(
+                (self.start.verse, self.end.verse),
+                (Some(start), Some(end)) if start > 0 && end > 0
+            ) || matches!((self.start.verse, self.end.verse), (None, None))
+        }
+    }
+
+    fn includes(&self, verse: &Verse) -> bool {
+        let Some((verse_start, verse_end)) = verse_number_span(&verse.number) else {
+            return false;
+        };
+        let after_start = verse.chapter > self.start.chapter
+            || (verse.chapter == self.start.chapter
+                && self.start.verse.is_none_or(|start| verse_end >= start));
+        let before_end = verse.chapter < self.end.chapter
+            || (verse.chapter == self.end.chapter
+                && self.end.verse.is_none_or(|end| verse_start <= end));
+        after_start && before_end
+    }
+}
+
+/// Verses selected by a passage request.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Passage {
+    pub request: PassageRequest,
+    pub verses: Vec<Verse>,
+}
+
+impl Passage {
+    /// Returns the verse texts joined with a single space.
+    pub fn text(&self) -> String {
+        self.verses
+            .iter()
+            .map(|verse| verse.text.as_str())
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -223,6 +388,17 @@ pub enum Error {
     InvalidLocale { value: String, reason: String },
     #[error("cannot determine a book code from manifest URI {0:?}")]
     InvalidBookUri(String),
+    #[error("invalid passage request {request:?}: {reason}")]
+    InvalidPassageRequest {
+        request: PassageRequest,
+        reason: &'static str,
+    },
+    #[error("book {0:?} was not found in this bundle")]
+    BookNotFound(String),
+    #[error("passage {0:?} contains no verses in this bundle")]
+    PassageNotFound(PassageRequest),
+    #[error("invalid USX chapter number {0:?}")]
+    InvalidChapterNumber(String),
 }
 
 #[derive(Default)]
@@ -302,7 +478,7 @@ fn parse_verses(path: &Path, book_code: &str) -> Result<Vec<Verse>, Error> {
     let mut buffer = Vec::new();
     let mut verses = Vec::new();
     let mut current = None::<Verse>;
-    let mut chapter = None::<String>;
+    let mut chapter = None::<u32>;
     let mut excluded_depth = 0_usize;
 
     loop {
@@ -367,7 +543,7 @@ fn record_usx_marker(
     reader: &Reader<BufReader<File>>,
     event: &BytesStart<'_>,
     book_code: &str,
-    chapter: &mut Option<String>,
+    chapter: &mut Option<u32>,
     current: &mut Option<Verse>,
     verses: &mut Vec<Verse>,
 ) -> Result<(), Error> {
@@ -375,7 +551,11 @@ fn record_usx_marker(
         b"chapter" => {
             finish_verse(current, verses);
             if let Some(number) = attribute(reader, event, b"number")? {
-                *chapter = Some(number);
+                *chapter = Some(
+                    number
+                        .parse()
+                        .map_err(|_| Error::InvalidChapterNumber(number))?,
+                );
             }
         }
         b"verse" => {
@@ -386,14 +566,16 @@ fn record_usx_marker(
 
             if let Some(number) = attribute(reader, event, b"number")? {
                 finish_verse(current, verses);
+                let chapter_number = chapter.unwrap_or(0);
                 let sid = attribute(reader, event, b"sid")?.unwrap_or_else(|| {
-                    chapter.as_deref().map_or_else(
+                    chapter.map_or_else(
                         || format!("{book_code} {number}"),
                         |chapter| format!("{book_code} {chapter}:{number}"),
                     )
                 });
                 *current = Some(Verse {
                     sid,
+                    chapter: chapter_number,
                     number,
                     text: String::new(),
                 });
@@ -413,6 +595,24 @@ fn finish_verse(current: &mut Option<Verse>, verses: &mut Vec<Verse>) {
 
 fn is_excluded(name: &[u8]) -> bool {
     matches!(name, b"note" | b"figure" | b"sidebar")
+}
+
+fn verse_number_span(number: &str) -> Option<(u32, u32)> {
+    let start = leading_number(number)?;
+    let end = number
+        .split_once('-')
+        .and_then(|(_, end)| leading_number(end))
+        .unwrap_or(start);
+    Some((start, end))
+}
+
+fn leading_number(value: &str) -> Option<u32> {
+    let digits = value
+        .trim_start()
+        .chars()
+        .take_while(char::is_ascii_digit)
+        .collect::<String>();
+    (!digits.is_empty()).then(|| digits.parse().ok()).flatten()
 }
 
 fn record_text(stack: &[String], value: &str, current_book: Option<&str>, metadata: &mut Metadata) {
