@@ -1,4 +1,5 @@
-use std::fs;
+use std::fs::{self, File};
+use std::io::BufReader;
 use std::path::{Path, PathBuf};
 
 use icu_locale::{Locale, LocaleCanonicalizer};
@@ -101,7 +102,7 @@ impl DblBundle {
             return Err(Error::MissingMetadata(root.to_path_buf()));
         }
 
-        let metadata = parse_metadata(&metadata_path)?;
+        let metadata = parse_metadata(BufReader::new(File::open(&metadata_path)?))?;
         let locale_source = metadata
             .ldml
             .as_deref()

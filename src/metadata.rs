@@ -1,7 +1,5 @@
 use std::collections::BTreeMap;
-use std::fs::File;
-use std::io::BufReader;
-use std::path::Path;
+use std::io::BufRead;
 
 use quick_xml::Reader;
 use quick_xml::escape::unescape;
@@ -9,6 +7,7 @@ use quick_xml::events::{BytesStart, Event};
 
 use crate::bundle::{BookNames, ScriptDirection};
 use crate::error::Error;
+use crate::xml::attribute;
 
 #[derive(Default)]
 pub(crate) struct Metadata {
@@ -26,8 +25,8 @@ pub(crate) struct Metadata {
     pub(crate) usx_resources: Vec<String>,
 }
 
-pub(crate) fn parse_metadata(path: &Path) -> Result<Metadata, Error> {
-    let mut reader = Reader::from_reader(BufReader::new(File::open(path)?));
+pub(crate) fn parse_metadata(source: impl BufRead) -> Result<Metadata, Error> {
+    let mut reader = Reader::from_reader(source);
     reader.config_mut().trim_text(false);
     let mut buffer = Vec::new();
     let mut stack = Vec::<String>::new();
@@ -147,8 +146,8 @@ fn trim_metadata(metadata: &mut Metadata) {
     }
 }
 
-fn record_empty_element(
-    reader: &Reader<BufReader<File>>,
+fn record_empty_element<R: BufRead>(
+    reader: &Reader<R>,
     event: &BytesStart<'_>,
     stack: &[String],
     metadata: &mut Metadata,
@@ -173,24 +172,36 @@ fn record_empty_element(
     Ok(())
 }
 
-fn attribute(
-    reader: &Reader<BufReader<File>>,
-    event: &BytesStart<'_>,
-    name: &[u8],
-) -> Result<Option<String>, quick_xml::Error> {
-    for attribute in event.attributes().with_checks(false) {
-        let attribute = attribute?;
-        if attribute.key.local_name().as_ref() == name {
-            return Ok(Some(
-                attribute
-                    .decode_and_unescape_value(reader.decoder())?
-                    .into_owned(),
-            ));
-        }
-    }
-    Ok(None)
-}
-
 pub(crate) fn required(value: Option<String>, field: &'static str) -> Result<String, Error> {
     value.ok_or(Error::MissingField(field))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_metadata_from_a_buffered_reader() {
+        let source = r#"<DBLMetadata id="bundle-id" revision="3">
+  <identification>
+    <name>Example &amp; Test Bible</name>
+    <abbreviation>EXAMPLE</abbreviation>
+  </identification>
+  <language><ldml>en-US</ldml><scriptDirection>LTR</scriptDirection></language>
+  <names><name id="book-gen"><long>Genesis</long></name></names>
+  <manifest><resource uri="release/USX_1/GEN.usx" /></manifest>
+</DBLMetadata>"#;
+
+        let metadata = parse_metadata(source.as_bytes()).unwrap();
+        assert_eq!(metadata.id.as_deref(), Some("bundle-id"));
+        assert_eq!(metadata.revision, Some(3));
+        assert_eq!(metadata.name.as_deref(), Some("Example & Test Bible"));
+        assert_eq!(metadata.ldml.as_deref(), Some("en-US"));
+        assert_eq!(
+            metadata.script_direction,
+            Some(ScriptDirection::LeftToRight)
+        );
+        assert_eq!(metadata.book_names["GEN"].long.as_deref(), Some("Genesis"));
+        assert_eq!(metadata.usx_resources, ["release/USX_1/GEN.usx"]);
+    }
 }

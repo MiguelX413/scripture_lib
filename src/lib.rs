@@ -35,6 +35,7 @@ mod bundle;
 mod error;
 mod metadata;
 mod passage;
+mod xml;
 
 /// Direct parsing of Unified Scripture XML documents.
 pub mod usx;

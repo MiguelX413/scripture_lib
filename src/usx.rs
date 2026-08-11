@@ -3,13 +3,16 @@
 //! These functions can be used independently of a Digital Bible Library
 //! bundle. [`book_code`](crate::usx::book_code) performs a lightweight read of
 //! the document header, while [`verses`](crate::usx::verses) parses its
-//! scripture text and validates the expected book code.
+//! scripture text and validates the expected book code. Use
+//! [`book_code_from_reader`](crate::usx::book_code_from_reader) and
+//! [`verses_from_reader`](crate::usx::verses_from_reader) for in-memory or
+//! other buffered sources.
 //!
 //! This module validates the USX structures it consumes, but it is not a full
 //! Relax NG validator for every element and style in a USX document.
 
 use std::fs::File;
-use std::io::BufReader;
+use std::io::{BufRead, BufReader};
 use std::path::Path;
 
 use quick_xml::Reader;
@@ -18,13 +21,22 @@ use quick_xml::events::{BytesStart, Event};
 
 use crate::error::Error;
 use crate::passage::Verse;
+use crate::xml::attribute;
 
 /// Reads and validates the three-character book code from a USX document.
 ///
 /// The document must declare a supported USX version and a `book` element with
 /// the required `id` style and `code` attribute.
 pub fn book_code(path: impl AsRef<Path>) -> Result<String, Error> {
-    parse_book_code(path.as_ref())
+    book_code_from_reader(BufReader::new(File::open(path)?))
+}
+
+/// Reads and validates a USX book code from a buffered byte stream.
+///
+/// This is the reader-based equivalent of [`book_code`] for USX content that
+/// does not originate from a filesystem path.
+pub fn book_code_from_reader(reader: impl BufRead) -> Result<String, Error> {
+    parse_book_code(reader)
 }
 
 /// Parses the verses in a USX document in document order.
@@ -35,11 +47,22 @@ pub fn book_code(path: impl AsRef<Path>) -> Result<String, Error> {
 /// boundary, or end of file also closes the current verse, allowing documents
 /// that omit verse-ending milestones.
 pub fn verses(path: impl AsRef<Path>, expected_book_code: &str) -> Result<Vec<Verse>, Error> {
-    parse_verses(path.as_ref(), expected_book_code)
+    verses_from_reader(BufReader::new(File::open(path)?), expected_book_code)
 }
 
-fn parse_verses(path: &Path, book_code: &str) -> Result<Vec<Verse>, Error> {
-    let mut reader = Reader::from_reader(BufReader::new(File::open(path)?));
+/// Parses USX verses from a buffered byte stream in document order.
+///
+/// This is the reader-based equivalent of [`verses`] for USX content that does
+/// not originate from a filesystem path.
+pub fn verses_from_reader(
+    reader: impl BufRead,
+    expected_book_code: &str,
+) -> Result<Vec<Verse>, Error> {
+    parse_verses(reader, expected_book_code)
+}
+
+fn parse_verses(source: impl BufRead, book_code: &str) -> Result<Vec<Verse>, Error> {
+    let mut reader = Reader::from_reader(source);
     reader.config_mut().trim_text(false);
     let mut buffer = Vec::new();
     let mut verses = Vec::new();
@@ -140,8 +163,8 @@ struct Chapter {
     sid: String,
 }
 
-fn parse_book_code(path: &Path) -> Result<String, Error> {
-    let mut reader = Reader::from_reader(BufReader::new(File::open(path)?));
+fn parse_book_code(source: impl BufRead) -> Result<String, Error> {
+    let mut reader = Reader::from_reader(source);
     let mut buffer = Vec::new();
     let mut found_version = false;
 
@@ -169,8 +192,8 @@ fn parse_book_code(path: &Path) -> Result<String, Error> {
     }
 }
 
-fn parse_usx_version(
-    reader: &Reader<BufReader<File>>,
+fn parse_usx_version<R: BufRead>(
+    reader: &Reader<R>,
     event: &BytesStart<'_>,
 ) -> Result<UsxVersion, Error> {
     let value =
@@ -189,8 +212,8 @@ fn parse_usx_version(
     })
 }
 
-fn validate_book(
-    reader: &Reader<BufReader<File>>,
+fn validate_book<R: BufRead>(
+    reader: &Reader<R>,
     event: &BytesStart<'_>,
     expected: &str,
 ) -> Result<(), Error> {
@@ -205,8 +228,8 @@ fn validate_book(
     Ok(())
 }
 
-fn validate_style(
-    reader: &Reader<BufReader<File>>,
+fn validate_style<R: BufRead>(
+    reader: &Reader<R>,
     event: &BytesStart<'_>,
     element: &'static str,
     expected: &'static str,
@@ -223,8 +246,8 @@ fn validate_style(
     Ok(())
 }
 
-fn validate_vid(
-    reader: &Reader<BufReader<File>>,
+fn validate_vid<R: BufRead>(
+    reader: &Reader<R>,
     event: &BytesStart<'_>,
     current: Option<&Verse>,
 ) -> Result<(), Error> {
@@ -246,8 +269,8 @@ fn validate_vid(
     Ok(())
 }
 
-fn record_usx_marker(
-    reader: &Reader<BufReader<File>>,
+fn record_usx_marker<R: BufRead>(
+    reader: &Reader<R>,
     event: &BytesStart<'_>,
     version: UsxVersion,
     book_code: &str,
@@ -418,27 +441,29 @@ fn leading_number(value: &str) -> Option<u32> {
     (!digits.is_empty()).then(|| digits.parse().ok()).flatten()
 }
 
-fn attribute(
-    reader: &Reader<BufReader<File>>,
-    event: &BytesStart<'_>,
-    name: &[u8],
-) -> Result<Option<String>, quick_xml::Error> {
-    for attribute in event.attributes().with_checks(false) {
-        let attribute = attribute?;
-        if attribute.key.local_name().as_ref() == name {
-            return Ok(Some(
-                attribute
-                    .decode_and_unescape_value(reader.decoder())?
-                    .into_owned(),
-            ));
-        }
-    }
-    Ok(None)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const USX: &str = r#"<usx version="3.0">
+  <book code="GEN" style="id" />
+  <chapter number="1" style="c" sid="GEN 1" />
+  <para style="p">
+    <verse number="1" style="v" sid="GEN 1:1" />In the beginning.
+    <verse eid="GEN 1:1" />
+  </para>
+  <chapter eid="GEN 1" />
+</usx>"#;
+
+    #[test]
+    fn parses_usx_from_buffered_readers() {
+        assert_eq!(book_code_from_reader(USX.as_bytes()).unwrap(), "GEN");
+
+        let verses = verses_from_reader(USX.as_bytes(), "GEN").unwrap();
+        assert_eq!(verses.len(), 1);
+        assert_eq!(verses[0].sid, "GEN 1:1");
+        assert_eq!(verses[0].text, "In the beginning.");
+    }
 
     #[test]
     fn parses_usx_verse_number_sequences() {
