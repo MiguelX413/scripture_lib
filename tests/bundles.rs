@@ -101,10 +101,13 @@ fn discovers_and_reads_a_dbl_folder() {
         &patch_version_path,
         r#"<usx version="3.0.8">
   <book code="MAT" style="id" />
-  <chapter number="1" style="c" sid="MAT 1" />
-  <para style="p"><verse number="1" style="v" sid="MAT 1:1" />Text.<verse eid="MAT 1:1" /></para>
-  <chapter eid="MAT 1" />
-</usx>"#,
+  <para style="mt1">Matthew</para>
+  <chapter number="01" style="c" sid="MAT 01"></chapter>
+  <para style="p"><verse number="1{RLM}-2" style="v" sid="MAT 01:1-2"></verse>Text</para>
+  <para style="q" vid="MAT01:1-2">continued.<verse eid="MAT01:1-2"></verse></para>
+  <chapter eid="MAT01"></chapter>
+</usx>"#
+            .replace("{RLM}", "\u{200f}"),
     )
     .unwrap();
     let missing_chapter_sid_path = directory.0.join("missing-chapter-sid.usx");
@@ -145,7 +148,11 @@ fn discovers_and_reads_a_dbl_folder() {
     assert!(genesis.read_usx().unwrap().contains("<usx"));
     assert_eq!(usx::book_code(genesis.path()).unwrap(), "GEN");
     assert_eq!(usx::book_code(&patch_version_path).unwrap(), "MAT");
-    assert_eq!(usx::verses(&patch_version_path, "MAT").unwrap().len(), 1);
+    let patch_version_verses = usx::verses(&patch_version_path, "MAT").unwrap();
+    assert_eq!(patch_version_verses.len(), 1);
+    assert_eq!(patch_version_verses[0].chapter, 1);
+    assert_eq!(patch_version_verses[0].number, "1\u{200f}-2");
+    assert_eq!(patch_version_verses[0].text, "Text continued.");
     assert!(matches!(
         usx::verses(&missing_chapter_sid_path, "MAT"),
         Err(Error::MissingUsxField("chapter/@sid"))

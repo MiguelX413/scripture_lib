@@ -51,23 +51,28 @@ fn parse_verses(path: &Path, book_code: &str) -> Result<Vec<Verse>, Error> {
     loop {
         match reader.read_event_into(&mut buffer)? {
             Event::Start(event) => {
-                match event.local_name().as_ref() {
-                    b"usx" => version = Some(parse_usx_version(&reader, &event)?),
-                    b"book" => {
-                        validate_book(&reader, &event, book_code)?;
-                        found_book = true;
-                    }
-                    b"chapter" => return Err(Error::NonEmptyUsxMilestone("chapter")),
-                    b"verse" => return Err(Error::NonEmptyUsxMilestone("verse")),
-                    _ => {}
-                }
-
                 if excluded_depth > 0 {
                     excluded_depth += 1;
                 } else if is_excluded(event.local_name().as_ref()) {
                     excluded_depth = 1;
                 } else {
-                    validate_vid(&reader, &event, current.as_ref())?;
+                    match event.local_name().as_ref() {
+                        b"usx" => version = Some(parse_usx_version(&reader, &event)?),
+                        b"book" => {
+                            validate_book(&reader, &event, book_code)?;
+                            found_book = true;
+                        }
+                        b"chapter" | b"verse" => record_usx_marker(
+                            &reader,
+                            &event,
+                            version.ok_or(Error::MissingUsxField("usx/@version"))?,
+                            book_code,
+                            &mut chapter,
+                            &mut current,
+                            &mut verses,
+                        )?,
+                        _ => validate_vid(&reader, &event, current.as_ref())?,
+                    }
                 }
             }
             Event::Empty(event) if excluded_depth == 0 => match event.local_name().as_ref() {
@@ -130,6 +135,7 @@ struct UsxVersion {
 
 struct Chapter {
     number: u32,
+    source_number: String,
     sid: String,
 }
 
@@ -230,7 +236,7 @@ fn validate_vid(
             actual,
         });
     };
-    if actual != current.sid {
+    if !identifiers_match(&actual, &current.sid) {
         return Err(Error::MismatchedVerseContinuation {
             expected: current.sid.clone(),
             actual,
@@ -255,7 +261,7 @@ fn record_usx_marker(
                 let Some(open) = chapter else {
                     return Err(Error::UnexpectedChapterEnd(actual));
                 };
-                if open.sid != actual {
+                if !identifiers_match(&open.sid, &actual) {
                     return Err(Error::MismatchedChapterEnd {
                         expected: open.sid.clone(),
                         actual,
@@ -269,15 +275,18 @@ fn record_usx_marker(
                 return Err(Error::MissingUsxField("chapter/@eid"));
             }
             validate_style(reader, event, "chapter", "c")?;
-            let number = attribute(reader, event, b"number")?
-                .ok_or(Error::MissingUsxField("chapter/@number"))?;
-            let number: u32 = number
+            let source_number = attribute(reader, event, b"number")?
+                .ok_or(Error::MissingUsxField("chapter/@number"))?
+                .trim()
+                .to_owned();
+            let number: u32 = source_number
                 .parse()
-                .map_err(|_| Error::InvalidChapterNumber(number))?;
-            let expected_sid = format!("{book_code} {number}");
+                .map_err(|_| Error::InvalidChapterNumber(source_number.clone()))?;
+            let expected_sid = format!("{book_code} {source_number}");
             let sid = match attribute(reader, event, b"sid")? {
                 Some(sid)
                     if version.major < 3
+                        || identifier_matches(&sid, book_code, &source_number)
                         || identifier_matches(&sid, book_code, &number.to_string()) =>
                 {
                     sid
@@ -292,14 +301,18 @@ fn record_usx_marker(
                 None if version.major < 3 => expected_sid,
                 None => return Err(Error::MissingUsxField("chapter/@sid")),
             };
-            *chapter = Some(Chapter { number, sid });
+            *chapter = Some(Chapter {
+                number,
+                source_number,
+                sid,
+            });
         }
         b"verse" => {
             if let Some(actual) = attribute(reader, event, b"eid")? {
                 let Some(open) = current else {
                     return Err(Error::UnexpectedVerseEnd(actual));
                 };
-                if open.sid != actual {
+                if !identifiers_match(&open.sid, &actual) {
                     return Err(Error::MismatchedVerseEnd {
                         expected: open.sid.clone(),
                         actual,
@@ -317,15 +330,14 @@ fn record_usx_marker(
                 .as_ref()
                 .ok_or(Error::MissingUsxField("chapter/@number"))?;
             let chapter_number = chapter.number;
-            let expected_sid = format!("{book_code} {chapter_number}:{number}");
+            let source_location = format!("{}:{number}", chapter.source_number);
+            let canonical_location = format!("{chapter_number}:{number}");
+            let expected_sid = format!("{book_code} {source_location}");
             let sid = match attribute(reader, event, b"sid")? {
                 Some(sid)
                     if version.major < 3
-                        || identifier_matches(
-                            &sid,
-                            book_code,
-                            &format!("{chapter_number}:{number}"),
-                        ) =>
+                        || identifier_matches(&sid, book_code, &source_location)
+                        || identifier_matches(&sid, book_code, &canonical_location) =>
                 {
                     sid
                 }
@@ -354,9 +366,21 @@ fn record_usx_marker(
 }
 
 fn identifier_matches(actual: &str, book_code: &str, location: &str) -> bool {
-    actual
-        .strip_prefix(book_code)
-        .is_some_and(|suffix| suffix == location || suffix == format!(" {location}"))
+    identifiers_match(actual, &format!("{book_code} {location}"))
+}
+
+fn identifiers_match(left: &str, right: &str) -> bool {
+    normalized_identifier(left) == normalized_identifier(right)
+}
+
+fn normalized_identifier(value: &str) -> String {
+    value
+        .chars()
+        .enumerate()
+        .filter_map(|(index, character)| {
+            (character != '\u{200f}' && !(index == 3 && character == ' ')).then_some(character)
+        })
+        .collect()
 }
 
 fn finish_verse(current: &mut Option<Verse>, verses: &mut Vec<Verse>) {
