@@ -16,7 +16,8 @@ use quick_xml::Reader;
 use quick_xml::escape::unescape;
 use quick_xml::events::{BytesStart, Event};
 
-use crate::{Error, Verse};
+use crate::error::Error;
+use crate::passage::Verse;
 
 /// Reads and validates the three-character book code from a USX document.
 ///
